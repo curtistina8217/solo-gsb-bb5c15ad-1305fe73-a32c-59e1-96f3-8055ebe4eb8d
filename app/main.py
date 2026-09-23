@@ -1,12 +1,13 @@
 """FastAPI 入口：任务创建 / 结果查询。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 
 from . import db
 from .alto import build_alto_xml
@@ -39,10 +40,77 @@ def health() -> Dict[str, str]:
 
 
 @app.post("/api/tasks", response_model=TaskCreated, status_code=201)
-def create_task(req: SortRequest, background: BackgroundTasks) -> TaskCreated:
-    """创建排序任务，立即返回任务 ID，排序在线程池后台执行。"""
+def create_task(
+    req: SortRequest,
+    background: BackgroundTasks,
+    response: Response,
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description=(
+            "可选幂等键：相同 key + 相同请求体重试不会重复入队，"
+            "直接返回原 task_id/status；相同 key + 不同请求体返回 409。"
+        ),
+    ),
+) -> TaskCreated:
+    """创建排序任务，立即返回任务 ID，排序在线程池后台执行。
+
+    带 ``Idempotency-Key`` 请求头时以该键做幂等：
+    键与请求体摘要（规范化 JSON 的 sha256）落库持久化；重试返回原任务，
+    并发相同请求也只创建一个任务（由数据库唯一约束保证）。
+    """
+    # Pydantic 规范化序列化：字段顺序/省略可选字段不影响摘要
+    request_json = req.model_dump_json()
+
+    key: Optional[str] = None
+    if idempotency_key is not None:
+        candidate = idempotency_key.strip()
+        if candidate:
+            if len(candidate) > db.IDEMPOTENCY_KEY_MAX_LEN:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Idempotency-Key too long: max "
+                        f"{db.IDEMPOTENCY_KEY_MAX_LEN} characters"
+                    ),
+                )
+            key = candidate
+        # 仅空白的头视为缺省，不做幂等处理
+
+    if key is not None:
+        request_hash = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+        task_id = uuid.uuid4().hex
+        result = db.reserve_idempotent_task(
+            key=key,
+            task_id=task_id,
+            request_json=request_json,
+            request_hash=request_hash,
+        )
+        if result["outcome"] == "created":
+            # 仅事务提交成功的胜出者入队后台任务
+            background.add_task(process_task, task_id)
+            return TaskCreated(task_id=task_id, status="pending")
+
+        existing = db.get_task(result["task_id"])
+        if existing is None:  # 不可达：登记与任务在同一事务写入
+            raise HTTPException(status_code=500, detail="task record missing")
+        if result["outcome"] == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Idempotency-Key was already used with a different request "
+                    f"body: existing_task_id={result['task_id']}"
+                ),
+            )
+        # 同键同体重试：返回原任务的当前状态，不重复入队
+        response.status_code = 200
+        return TaskCreated(
+            task_id=existing["task_id"], status=existing["status"]
+        )
+
+    # 未携带幂等键：保持原有行为
     task_id = uuid.uuid4().hex
-    db.create_task(task_id, req.model_dump_json())
+    db.create_task(task_id, request_json)
     background.add_task(process_task, task_id)
     return TaskCreated(task_id=task_id, status="pending")
 

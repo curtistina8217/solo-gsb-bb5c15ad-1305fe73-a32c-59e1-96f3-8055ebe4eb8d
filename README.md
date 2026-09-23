@@ -69,6 +69,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ### `POST /api/tasks` — 创建排序任务
 
+请求头（可选）：
+
+| 请求头 | 说明 |
+| --- | --- |
+| `Idempotency-Key` | 客户端生成的幂等键（最长 255 字符，建议 UUID）。**省略时行为与旧版完全一致**，每次请求都创建新任务 |
+
 请求体：
 
 | 字段 | 类型 | 说明 |
@@ -82,10 +88,53 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `words[].quad` | 4 个点 | 四角坐标，建议按左上→右上→右下→左下顺序（顺序不强制，服务自动归一化） |
 | `words[].quad[].x/y` | number | 角点坐标 |
 
-`201` 响应：
+`201` 响应（首次请求，或未携带幂等键）：
 
 ```json
 { "task_id": "5f1c…", "status": "pending" }
+```
+
+#### 幂等重试（`Idempotency-Key`）
+
+携带 `Idempotency-Key` 时，服务把 **key 与规范化请求体的 sha256 摘要**一并持久化到
+SQLite（`idempotency_keys` 表），行为如下：
+
+| 场景 | HTTP 状态 | 响应 |
+| --- | --- | --- |
+| key 首次出现 | `201` | 正常创建并**只入队一次**后台任务：`{"task_id": "...", "status": "pending"}` |
+| 同 key + **相同请求体**重试（网络超时后重发等） | `200` | 不创建新任务、不重复入队，返回**原 task_id 与当前实时状态**（任务已完成则为 `done`） |
+| 同 key + **不同请求体** | `409` | `{"detail": "Idempotency-Key was already used with a different request body: existing_task_id=..."}` |
+
+- 请求摘要基于服务端规范化后的 JSON 计算：JSON 字段书写顺序、是否省略
+  `confidence`/`id` 等可选字段（等价于 `null`）不影响判定；任何实质字段不同即冲突。
+- 幂等保证覆盖**并发**：多个相同 key + 相同请求体的请求同时到达时，由数据库唯一约束
+  保证只有一个事务登记成功并创建任务，其余请求回读到胜出记录并返回 `200`，
+  因此**并发重试也只会创建一个任务、处理一次**。
+- 键在服务端**持久化**，容器/进程重启后仍可用于重试（数据保留在 `/data/ocr_sort.db`）。
+- 新表随服务启动自动创建（`CREATE TABLE IF NOT EXISTS`），**无需手动迁移**，
+  已有数据库中的历史任务不受影响。
+
+```bash
+# 首次请求
+curl -s -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7e8f5a2c-01a2-4b3c-9d8e-112233445566" \
+  --data @examples/request.json
+# 201 {"task_id":"<TASK_ID>","status":"pending"}
+
+# 同 key 同体重试（例如首次响应超时后重发）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7e8f5a2c-01a2-4b3c-9d8e-112233445566" \
+  --data @examples/request.json
+# 200，响应体仍是原 task_id；任务已完成时 status 为 done
+
+# 同 key 换了请求体
+curl -s -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7e8f5a2c-01a2-4b3c-9d8e-112233445566" \
+  -d '{"page_width":999,"page_height":1400,"words":[]}'
+# 409 {"detail":"Idempotency-Key was already used with a different request body: ..."}
 ```
 
 ### `GET /api/tasks/{task_id}` — 查询状态与结果
@@ -192,9 +241,10 @@ curl -s -o result.alto.xml \
 [`examples/request.json`](examples/request.json)。
 
 ```bash
-# 1) 创建任务
+# 1) 创建任务（建议携带 Idempotency-Key，超时重发不会重复入队）
 curl -s -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen 2>/dev/null || echo demo-key)" \
   --data @examples/request.json
 # {"task_id":"<TASK_ID>","status":"pending"}
 
@@ -252,7 +302,10 @@ pytest -q
 质量报告四类异常规则（低置信/字号离群/重叠/间隙异常）及其确定性与只读性、
 ALTO 4.3 导出（页面尺寸/块/行/词的阅读顺序、原始四角外接框、置信度、
 特殊字符转义、确定性、404/409 错误结构）、
-HTTP 全流程（含 404/409 统一错误结构）。
+HTTP 全流程（含 404/409 统一错误结构）、
+`Idempotency-Key` 幂等（同键同体重放返回 200 原任务且不重复入队、
+同键异体 409、规范化摘要等价、省略头的旧行为、空白/超长 key 处理、
+并发同键只创建一个任务、并发同键异体只有一个胜出）。
 
 ## 项目结构
 
@@ -266,7 +319,8 @@ app/
   quality.py   词框质量报告（中位数/MAD 稳健离群、重叠与间隙检测，确定性只读）
   alto.py      ALTO 4.3 XML 导出（块/行/词按结果顺序序列化，确定性只读）
   worker.py    后台任务执行（线程池）
-  db.py        SQLite 持久化（SQLAlchemy Core）
+  db.py        SQLite 持久化（SQLAlchemy Core；tasks 与
+               idempotency_keys 表，幂等键与请求摘要原子登记）
 examples/
   request.json 示例请求
 tests/         单元测试与接口测试
