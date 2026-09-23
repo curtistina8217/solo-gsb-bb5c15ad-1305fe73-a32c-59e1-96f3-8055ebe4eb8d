@@ -69,6 +69,27 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ### `POST /api/tasks` — 创建排序任务
 
+可选请求头 `Idempotency-Key`（任意字符串，最长 255）实现**请求幂等**，
+适合网络重试、超时重发等场景：
+
+| 场景 | 行为 | 状态码 |
+| --- | --- | --- |
+| 不携带该头（或值为空白） | 与历史版本一致，每次请求创建新任务 | `201` |
+| 同 key + **相同请求体**首次请求 | 正常创建并入队异步任务 | `201` |
+| 同 key + **相同请求体**重试 | 返回**原 task_id 与当前 status**，不重复入队 | `200` |
+| 同 key + **不同请求体** | 拒绝请求（key 不能被复用给不同语义的请求） | `409` |
+
+幂等判定基于 Pydantic 规范化后请求体的 SHA-256 摘要，因此 JSON 字段顺序、
+空白等表层差异不影响“相同请求体”的判定；不同的页面尺寸/词框内容会稳定得到
+`409 {"detail": "Idempotency-Key already used with a different request body"}`。
+
+key 与请求摘要持久化在 SQLite 的 `idempotency_keys` 表中，服务重启后仍然有效；
+该表在首次启动时自动补建（`CREATE TABLE IF NOT EXISTS`，无需迁移脚本），
+**旧版本已有的数据库文件可直接挂载使用**，历史任务数据不受影响。
+
+并发说明：`idempotency_keys.key` 为主键，任务与幂等记录在同一事务内插入，
+因此并发的同 key 相同请求也只会有一个真正创建任务，其余请求返回该任务。
+
 请求体：
 
 | 字段 | 类型 | 说明 |
@@ -82,10 +103,32 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `words[].quad` | 4 个点 | 四角坐标，建议按左上→右上→右下→左下顺序（顺序不强制，服务自动归一化） |
 | `words[].quad[].x/y` | number | 角点坐标 |
 
-`201` 响应：
+`201` 响应（新任务；幂等重试命中时为 `200`，响应体结构相同）：
 
 ```json
 { "task_id": "5f1c…", "status": "pending" }
+```
+
+幂等重试示例：
+
+```bash
+# 首次请求：201
+curl -s -i -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7e1f-batch-42" \
+  --data @examples/request.json
+# HTTP/1.1 201 Created
+# {"task_id":"<TASK_ID>","status":"pending"}
+
+# 同 key 同请求体重试（如网络超时后重发）：200，task_id 不变，不重复入队
+curl -s -i -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7e1f-batch-42" \
+  --data @examples/request.json
+# HTTP/1.1 200 OK
+# {"task_id":"<TASK_ID>","status":"done"}
+
+# 同 key 换请求体：409
 ```
 
 ### `GET /api/tasks/{task_id}` — 查询状态与结果
@@ -192,7 +235,7 @@ curl -s -o result.alto.xml \
 [`examples/request.json`](examples/request.json)。
 
 ```bash
-# 1) 创建任务
+# 1) 创建任务（可加 -H "Idempotency-Key: <客户端生成的唯一键>" 实现安全重试）
 curl -s -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
   --data @examples/request.json
@@ -252,7 +295,9 @@ pytest -q
 质量报告四类异常规则（低置信/字号离群/重叠/间隙异常）及其确定性与只读性、
 ALTO 4.3 导出（页面尺寸/块/行/词的阅读顺序、原始四角外接框、置信度、
 特殊字符转义、确定性、404/409 错误结构）、
-HTTP 全流程（含 404/409 统一错误结构）。
+HTTP 全流程（含 404/409 统一错误结构）、
+`Idempotency-Key` 幂等（同 key 同体重试返回原任务 200、异体重试 409、
+空白头按无幂等处理、并发同 key 只创建一个任务、旧版 SQLite 库自动补表兼容）。
 
 ## 项目结构
 
@@ -266,7 +311,7 @@ app/
   quality.py   词框质量报告（中位数/MAD 稳健离群、重叠与间隙检测，确定性只读）
   alto.py      ALTO 4.3 XML 导出（块/行/词按结果顺序序列化，确定性只读）
   worker.py    后台任务执行（线程池）
-  db.py        SQLite 持久化（SQLAlchemy Core）
+  db.py        SQLite 持久化（SQLAlchemy Core；tasks 与 idempotency_keys 表）
 examples/
   request.json 示例请求
 tests/         单元测试与接口测试

@@ -6,7 +6,9 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi import (
+    BackgroundTasks, FastAPI, Header, HTTPException, Response,
+)
 
 from . import db
 from .alto import build_alto_xml
@@ -28,7 +30,7 @@ app = FastAPI(
         "提交页面宽高与带四角坐标的 OCR 词框，服务按几何位置自动聚类文本行，"
         "在倾斜、行距不均、双栏版面下输出稳定的阅读顺序。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -39,10 +41,55 @@ def health() -> Dict[str, str]:
 
 
 @app.post("/api/tasks", response_model=TaskCreated, status_code=201)
-def create_task(req: SortRequest, background: BackgroundTasks) -> TaskCreated:
-    """创建排序任务，立即返回任务 ID，排序在线程池后台执行。"""
+def create_task(
+    req: SortRequest,
+    background: BackgroundTasks,
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+        description="可选幂等键：同 key + 同请求体重试返回原任务，不重复入队；"
+                    "同 key + 不同请求体返回 409。",
+    ),
+):
+    """创建排序任务，立即返回任务 ID，排序在线程池后台执行。
+
+    携带 ``Idempotency-Key`` 请求头时启用幂等：
+    - 该 key 首次出现：正常创建任务，返回 ``201``；
+    - 同 key 搭配相同请求体重试：不重复入队，返回原任务 ID 与当前
+      状态，状态码 ``200``；
+    - 同 key 搭配不同请求体：返回 ``409``。
+    不携带该头时行为与历史版本一致。
+    """
+    # 规范化后的请求体作为摘要输入：字段顺序/空白等表层差异不影响判定
+    request_json = req.model_dump_json()
+
+    if not idempotency_key or not idempotency_key.strip():
+        task_id = uuid.uuid4().hex
+        db.create_task(task_id, request_json)
+        background.add_task(process_task, task_id)
+        return TaskCreated(task_id=task_id, status="pending")
+
+    key = idempotency_key.strip()
     task_id = uuid.uuid4().hex
-    db.create_task(task_id, req.model_dump_json())
+    try:
+        existing_id = db.create_idempotent_task(key, task_id, request_json)
+    except db.IdempotencyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key already used with a different request body",
+        )
+
+    if existing_id != task_id:
+        # 同 key 同请求体重试：返回原任务的当前状态，不再入队
+        row = db.get_task(existing_id)
+        status = row["status"] if row else "pending"
+        return Response(
+            content=json.dumps({"task_id": existing_id, "status": status}),
+            media_type="application/json",
+            status_code=200,
+        )
+
     background.add_task(process_task, task_id)
     return TaskCreated(task_id=task_id, status="pending")
 
